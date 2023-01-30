@@ -3,30 +3,26 @@
  
 import CachePkg::*;
 
-/*
-    Parmeterized set-associative cache
-    LRU eviction policy
-    Write-back policy
-*/
+// Parmeterized set-associative cache with LRU eviction and write-back policy
 
 module SetAssociativeCache
 (
     input logic Clk,
-    input logic Rst,    // FIXME Clayton not currently used
-    input CacheAddr_t Addr,
-    output logic AddrRdy,
-    input logic RdEn,
-    input logic WrEn,
-    input logic RdFillEn,
-    input logic [LINE_BITS-1:0] WrData,
-    output logic WrDataRdy,
-    output logic Hit,
-    output logic HitVal,
-    output logic [LINE_BITS-1:0] RdData,
-    output logic [ADDR_BITS-1:0] WrBackAddr,
-    output logic WrBackAddrVal,
-    output logic WrBackDataVal,
-    input logic WrBackAddrRdy
+    input logic Rst,
+    input CacheAddr_t Addr,                     // Read or write address
+    output logic AddrRdy,                       // Ready to receive read or write address
+    input logic RdEn,                           // Read address is valid; begin read
+    input logic WrEn,                           // Write address/data is valid; begin write
+    input logic RdFillEn,                       // Read fill data is valid; begin read fill
+    input logic [LINE_BITS-1:0] DataIn,         // Write data or read fill data
+    output logic DataInRdy,                     // Ready to receive write data or read fill data
+    output logic Hit,                           // Was it a hit or a miss?
+    output logic HitVal,                        // Hit/miss result is valid
+    output logic [LINE_BITS-1:0] DataOut,       // Read-hit data or write-back data
+    output logic RdHitDataVal,                  // Read-hit data is valid   
+    output logic [ADDR_BITS-1:0] WrBackAddr,    // Address of dirty line we're writing back
+    output logic WrBackVal,                     // WriteBack address and WriteBack data are valid
+    input logic WrBackRdy                       // WriteBack is finished
 );
 
     // Declarations
@@ -35,7 +31,6 @@ module SetAssociativeCache
     CacheAddr_t Addr_1;
     CacheState_t CacheState, CacheStateD;
     logic LdInputAddr, LdInputData;
-    
     logic HitValD;
 
     // Line state
@@ -48,7 +43,7 @@ module SetAssociativeCache
 
     // Line state control
     logic LineStateRdEn;
-    logic [SET_PTR_BITS-1:0] HitIdx_1, ReplIdx_1, MRUIdx_1; // MRUIdx will be selected from HitIdx or ReplIdx
+    logic [SET_PTR_BITS-1:0] HitIdx_1, ReplIdx_1, MRUIdx_1;
     logic [SET_SIZE-1:0] HitIdxOneHot_1, LRUIdxOneHot_1, ReplIdxOneHot_1;
     logic Hit_1;
     logic InvalidateMRU, ValidateMRU, UpdateValid;
@@ -58,25 +53,32 @@ module SetAssociativeCache
     logic [SET_PTR_BITS-1:0] AgeThreshold;
 
     // Line data reads/writes
-    logic [LINE_BITS-1:0] WrData_1;
+    logic [LINE_BITS-1:0] DataIn_1;
     logic [IDX_BITS+SET_PTR_BITS-1:0] CacheLineAddr_1;
-    logic [LINE_BITS-1:0] CacheLineWrData;
-    logic [LINE_BITS-1:0] CacheLineRdData;
+    logic [LINE_BITS-1:0] DataOutD;
+    logic [LINE_BITS-1:0] CacheLineDataIn;
+    logic [LINE_BITS-1:0] CacheLineDataOut;
     logic CacheLineRdEn, CacheLineWrEn;
 
     // Cache structure
-
-    // SRAMs holding cache line state metadata
+    /*
+        Separate SRAMs storing state data for cache lines
+        Logically, these are 2D arrays with shape [NUM_CACHE_SETS, SET_SIZE].
+        Not sure if asynchronous SRAMs are actually what you'd do here, but the 
+        memory needs to be fast, since in my design you read the state of the
+        set you're indexing, then flop in the set's state along with your input 
+        signals in the same cycle.
+    */
 
     AsynchSRAMModel #(.DEPTH(NUM_CACHE_SETS), .WIDTH(SET_SIZE))
     CacheLineValid
     (
         .Rst(Rst),
         .Addr(Addr.Idx),
-        .WrData(LineValidD),
+        .DataIn(LineValidD),
         .RdEn(LineStateRdEn),
         .WrEn(UpdateValid),
-        .RdData(LineValid)
+        .DataOut(LineValid)
     ); 
 
     AsynchSRAMModel #(.DEPTH(NUM_CACHE_SETS), .WIDTH(SET_SIZE))
@@ -84,10 +86,10 @@ module SetAssociativeCache
     (
         .Rst(Rst),
         .Addr(Addr.Idx),
-        .WrData(LineDirtyD),
+        .DataIn(LineDirtyD),
         .RdEn(LineStateRdEn),
         .WrEn(UpdateDirty),
-        .RdData(LineDirty)
+        .DataOut(LineDirty)
     ); 
 
     AsynchSRAMModel #(.DEPTH(NUM_CACHE_SETS), .WIDTH(SET_SIZE*SET_PTR_BITS))
@@ -95,37 +97,51 @@ module SetAssociativeCache
     (
         .Rst(Rst),
         .Addr(Addr.Idx),
-        .WrData(LineAgeD),
+        .DataIn(LineAgeD),
         .RdEn(LineStateRdEn),
         .WrEn(UpdateAge),
-        .RdData(LineAge)
+        .DataOut(LineAge)
     ); 
 
-    AsynchSRAMModel #(.DEPTH(NUM_CACHE_SETS), .WIDTH(SET_SIZE*SET_PTR_BITS))
+    AsynchSRAMModel #(.DEPTH(NUM_CACHE_SETS), .WIDTH(SET_SIZE*TAG_BITS))
     CacheLineTag
     (
         .Rst(Rst),
         .Addr(Addr.Idx),
-        .WrData(LineTagD),
+        .DataIn(LineTagD),
         .RdEn(LineStateRdEn),
         .WrEn(UpdateValid),
-        .RdData(LineTag)
+        .DataOut(LineTag)
     ); 
 
-    // SRAM holding cache line data
+    // SRAM storing cache line date
+    // Logically, it's a flattened array of length NUM_CACHE_SETS*SET_SIZE
 
     AsynchSRAMModel #(.DEPTH(NUM_LINES), .WIDTH(LINE_BITS))
     CacheLineData
     (
         .Rst(1'b0),
         .Addr(CacheLineAddr_1)
-        .WrData(CacheLineWrData),
+        .DataIn(CacheLineDataIn),
         .RdEn(CacheLineRdEn),
         .WrEn(CacheLineWrEn),
-        .RdData(CacheLineRdData)
+        .DataOut(CacheLineDataOut)
     ); 
 
-    // Cache state machine / control
+    // Cache state machine / controller
+    /*
+        The cache has 6 states:
+        1) Idle - Ready to receive new read or write transaction
+        2) Read - Reading cache line and/or calculating hit or miss
+        3) Write - Writing cache line and/or calculating hit or miss
+        4) ReadWriteback - A dirty line has been evicted from the cache on a read miss
+                         - This is a separate state from WriteWriteback, since we
+                           we also must go into the ReadFill state from here, since
+                           it was a miss
+        5) WriteWriteback - A dirty line has been evicted from the cache on a write miss
+        6) ReadFill - We're waiting to fill the line we've allocated on a read miss
+                      with data from main memory
+    */
 
     assert ((RdEn != WrEn) && (RdEn != ReplEn) && (WrEn != ReplEn)) else $error("Invalid RdEn/WrEn/ReplEn combo");
 
@@ -146,19 +162,20 @@ module SetAssociativeCache
 
         CacheLineRdEn = 1'b0;
         CacheLineWrEn = 1'b0;
-        CacheLineWrData = WrData_1;
+        CacheLineDataIn = DataIn_1;
+        DataOutD = CacheLineDataOut;
 
         AddrRdy = 1'b0;
-        WrDataRdy = 1'b0;
+        DataInRdy = 1'b0;
 
-        WrBackAddrVal = 1'b0;
-        WrBackDataVal = 1'b0;
+        WrBackVal = 1'b0;
         HitValD = HitVal;
+        RdHitDataValD = RdHitDataVal;
 
         case (CacheState)
             IDLE: begin
                 AddrRdy = 1'b1;
-                WrDataRdy = 1'b1;
+                DataInRdy = 1'b1;
                 if (RdEn) begin
                     CacheStateD = READ;
                     LdInputAddr = 1'b1;
@@ -236,8 +253,7 @@ module SetAssociativeCache
                 end
             end
             READ_WB: begin
-                WrBackAddrVal = 1'b1;
-                WrBackDataVal = 1'b1;
+                WrBackVal = 1'b1;
                 HitValD = 1'b0;
                 if (WrBackRdy) begin
                     CacheStateD = READ_FILL;
@@ -247,8 +263,7 @@ module SetAssociativeCache
                 end
             end
             WRITE_WB: begin
-                WrBackAddrVal = 1'b1;
-                WrBackDataVal = 1'b1;
+                WrBackVal = 1'b1;
                 HitValD = 1'b0;
                 if (WrBackRdy) begin
                     CacheStateD = IDLE;
@@ -263,14 +278,16 @@ module SetAssociativeCache
             end
             READ_FILL: begin
                 HitValD = 1'b0;
-                WrDataRdy = 1'b1;
+                DataInRdy = 1'b1;
                 if (RdFillEn) begin
                     CacheStateD = IDLE;
                     CacheLineWrEn = 1'b1;
                     MakeCleanMRU = 1'b1;
                     ValidateMRU = 1'b1;
                     UpdateTag = 1'b1;
-                    CacheLineWrData = WrData;
+                    CacheLineDataIn = DataIn;
+                    DataOutD = DataIn;
+                    ReadDataValD = 1'b1;
                 end
                 else begin
                     CacheStateD = READ_FILL;
@@ -279,56 +296,68 @@ module SetAssociativeCache
         endcase
     end
 
-    // Input and line state read flops
+    // Input and line state read flip-flops
 
     assign UpdateValid = InvalidateMRU | ValidateMRU;
     assign UpdateDirty = MakeCleanMRU | MakeDirtyMRU;
-    flop #(4)         I_CacheState      (.Q(CacheState),    .D(CacheStateD), .Clk(Clk), .En(1'b1));
-    flop #(ADDR_BITS) I_Addr_1          (.Q(Addr_1),        .D(Addr),        .Clk(Clk), .En(LdInputAddr));
-    flop #(LINE_BITS) I_WrData_1        (.Q(WrData_1),      .D(WrData),      .Clk(Clk), .En(LdInputData));
-    flop #(SET_SIZE)  I_LineValid_1     (.Q(LineValid_1),   .D(LineValid),   .Clk(Clk), .En(LineStateRdEn));
-    flop #(SET_SIZE)  I_LineDirty_1     (.Q(LineDirty_1),   .D(LineDirty),   .Clk(Clk), .En(LineStateRdEn));
-    flop #(SET_SIZE)  I_LineAge_1       (.Q(LineAge_1),     .D(LineAge),     .Clk(Clk), .En(LineStateRdEn));
-    flop #(SET_SIZE)  I_LineTag_1       (.Q(LineTag_1),     .D(LineTag),     .Clk(Clk), .En(LineStateRdEn));
+    dff #(4)                        I_CacheState      (.Q(CacheState),    .D(CacheStateD), .Clk(Clk), .En(1'b1));
+    dff #(ADDR_BITS)                I_Addr_1          (.Q(Addr_1),        .D(Addr),        .Clk(Clk), .En(LdInputAddr));
+    dff #(LINE_BITS)                I_DataIn_1        (.Q(DataIn_1),      .D(DataIn),      .Clk(Clk), .En(LdInputData));
+    dff #(SET_SIZE)                 I_LineValid_1     (.Q(LineValid_1),   .D(LineValid),   .Clk(Clk), .En(LineStateRdEn));
+    dff #(SET_SIZE)                 I_LineDirty_1     (.Q(LineDirty_1),   .D(LineDirty),   .Clk(Clk), .En(LineStateRdEn));
+    dff #(SET_SIZE*SET_PTR_BITS)    I_LineAge_1       (.Q(LineAge_1),     .D(LineAge),     .Clk(Clk), .En(LineStateRdEn));
+    dff #(SET_SIZE*TAG_BITS)        I_LineTag_1       (.Q(LineTag_1),     .D(LineTag),     .Clk(Clk), .En(LineStateRdEn));
 
-    // Determine whether we have a cache hit or miss; determine which line to allocate/replace if it turns out to be a miss
+    // Determine whether we have a cache hit or miss; determine which line to 
+    // allocate/replace if it turns out to be a miss
 
     for (genvar i=0; i<SET_SIZE; i++) begin
 
-        // Reshape set state metadatar into array of individual lines' state metadata
+        // Reshape set state metadata into array of packed structs
         assign CacheLineInfo_1[i].Valid = LineValid_1[i];
         assign CacheLineInfo_1[i].Dirty = LineDirty_1[i];
         assign CacheLineInfo_1[i].Age = LineAge_1[i];
         assign CacheLineInfo_1[i].Tag = LineTag_1[i];
 
-        // Decode cache hit and find LRU entry in case we need to evict
+        // Calculate cache hit, and find LRU entry in case we need to evict
         assign HitIdxOneHot_1[i] = (Addr_1.Tag == LineTag_1[i]) & (LineValid_1[i]);
         assign LRUIdxOneHot_1[i] = ~(|LineAge_1[i]) & (LineValid_1[i]);
     end
 
-    // We can evict any invalid entry, or the LRU entry
-    assign ReplIdxOneHot_1 = ~(CacheSetInfo.Valid) | LRUIdxOneHot_1;
+    logic InvalidEntryExists;
+    logic [SET_SIZE-1:0] LineInvalid_1;
 
-    assign Hit_1 = |HitIdxOneHot_1;
-    assign MRUIdx_1 = Hit_1 ? HitIdx_1 : ReplIdx_1;
-    assign FullCacheAddr_1 = {Addr_1.Idx, MRUIdx_1};
+    assign LineInvalid_1 = ~LineValid_1;
+    assign InvalidEntryExists = |LineInvalid_1;
+
+    // Prioritize allocating any invalid entry
+    // If there isn't one; evict the LRU entry
+    assign ReplIdxOneHot_1 = InvalidEntryExists ? LineInvalid_1 : LRUIdxOneHot_1;
 
     always_comb begin
         HitIdx_1 = '0;
         ReplIdx_1 = '0;
         HitLineInfo_1 = '0;
         ReplLineInfo_1 = '0;
-        for (int i=SET_SIZE-1; i>=0; i--) begin
+        for (int i=0; i<SET_SIZE; i++) begin
 
-            // Normal mux to select line you hit
+            // Select line you hit you hit
             HitIdx_1 |= HitIdxOneHot_1[i] ? SET_PTR_BITS'(i) : '0;
             HitLineInfo_1 |= HitIdxOneHot_1[i] ? CacheLineInfo_1[i] : '0;
 
-            // Priority mux to select a line to evict
-           if (ReplIdxOneHot_1[i]) ReplIdx_1 = SET_PTR_BITS'(i);
-           if (ReplIdxOneHot_1[i]) ReplLineInfo_1 = CacheLineInfo_1[i];
+            // Select line you want to allocate
+            ReplIdx_1 |= ReplIdxOneHot_1[i] ? SET_PTR_BITS'(i) : '0;
+            ReplLineInfo_1 |= ReplIdxOneHot_1[i] CacheLineInfo_1[i] : '0;
         end
     end   
+
+    assign Hit_1 = |HitIdxOneHot_1;
+    assign MRUIdx_1 = Hit_1 ? HitIdx_1 : ReplIdx_1;
+
+    // Concatenate flat cache read address
+    // Note this will read the correct cache line
+    // whether it was a hit or miss
+    assign CacheLineAddr = {Addr_1.Idx, MRUIdx_1};
 
     // Calculate next MRU state values
 
@@ -336,16 +365,19 @@ module SetAssociativeCache
         assign LineAgeD[i]   =    (i == MRUIdx_1)               ? {SET_PTR_BITS{1'b1}} : '0 
                                 | (LineAge_1[i] < AgeThreshold) ? LineAge_1[i]         : '0 
                                 | (LineAge_1[i] > AgeThreshold) ? LineAge_1[i] - 1     : '0;
+
         assign LineValidD[i] =    (i != MRUIdx_1) & LineValid_1[i]
                                 | (i == MRUIdx_1) & ValidateMRU
                                 | !InvalidateMRU  & LineValid_1[i];
+
         assign LineDirtyD[i] =    (i != MRUIdx_1) & LineDirty_1[i]
                                 | (i == MRUIdx_1) & MakeDirtyMRU
                                 | !MakeCleanMRU   & LineDirty_1[i];
+                                
         assign LineTagD[i]   =    (i == MRUIdx_1) ? Addr_1.Tag  : LineTag_1[i];
     end
 
-    // Output flops
+    // Output flip-flops
 
     CacheAddr_t WrBackAddrD;
 
@@ -353,10 +385,12 @@ module SetAssociativeCache
     assign WrBackAddrD.Idx = MRUIdx_1;
     assign WrBackAddrD.Offs = OFFS_BITS'(0);
 
-    flop #(ADDR_BITS)   I_WrBackAddr    (.Q(WrBackAddr),    .D(WrBackAddrD),     .Clk(Clk), .En(1'b1));
-    flop #(LINE_BITS)   I_RdData        (.Q(RdData),        .D(CacheLineRdData), .Clk(Clk), .En(1'b1));
-    flop #(1)           I_Hit           (.Q(Hit),           .D(Hit_1),           .Clk(Clk), .En(1'b1));
-    flop #(1)           I_HitVal        (.Q(HitVal),        .D(HitValD),         .Clk(Clk), .En(1'b1));
+    dff #(ADDR_BITS)   I_WrBackAddr    (.Q(WrBackAddr),    .D(WrBackAddrD),     .Clk(Clk), .En(1'b1));
+    dff #(LINE_BITS)   I_WrBackData    (.Q(WrBackData),    .D(WrBackDataD),     .Clk(Clk), .En(1'b1));
+    dff #(LINE_BITS)   I_DataOut       (.Q(DataOut),       .D(DataOutD),        .Clk(Clk), .En(1'b1));
+    dff #(1)           I_RdHitDataVal  (.Q(RdHitDataVal),  .D(RdHitDataValD),   .Clk(Clk), .En(1'b1));
+    dff #(1)           I_Hit           (.Q(Hit),           .D(Hit_1),           .Clk(Clk), .En(1'b1));
+    dff #(1)           I_HitVal        (.Q(HitVal),        .D(HitValD),         .Clk(Clk), .En(1'b1));
 
 endmodule
 
